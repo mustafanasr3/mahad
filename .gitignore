@@ -11,3 +11,12 @@ venv/
 .upload_tmp/
 static/uploads/*
 !static/uploads/.gitkeep
+!static/uploads/090ceeccc59d9aaa.webp
+!static/uploads/14694e5c325148b1.webp
+!static/uploads/56e573b889064b39.webp
+!static/uploads/79e4b8bfee177709.webp
+!static/uploads/b24edc54a93c341b.webp
+!static/uploads/c5702f8f43ed79b4.webp
+!static/uploads/cef05666d5c62040.webp
+!static/uploads/f772c40164d56d3a.webp
+!static/uploads/fef25682f4b0b5e2.webp

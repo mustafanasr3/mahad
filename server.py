@@ -28,6 +28,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
+from postgres import (
+    DB_ERRORS,
+    DB_INTEGRITY_ERRORS,
+    connect as connect_postgres,
+    postgres_schema,
+)
+
 BASE = Path(__file__).resolve().parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
@@ -37,6 +44,7 @@ STATIC = BASE / "static"
 UPLOADS = STATIC / "uploads"
 UPLOAD_TMP = BASE / ".upload_tmp"
 DB_PATH = os.environ.get("DB_PATH", str(BASE / "mahad.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -364,12 +372,33 @@ CREATE INDEX IF NOT EXISTS idx_sermons_published ON sermons(published,sort,id);
 CREATE INDEX IF NOT EXISTS idx_words_published ON words(published,sort,id);
 """
 
+_PG_ID_TABLES = frozenset(
+    match.group(1).lower()
+    for match in re.finditer(r"CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\((.*?)\);", SCHEMA, re.S)
+    if re.search(r"\bid INTEGER PRIMARY KEY AUTOINCREMENT\b", match.group(2), re.I)
+)
+
 
 def db():
+    if DATABASE_URL:
+        return connect_postgres(DATABASE_URL, _PG_ID_TABLES)
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def table_columns(conn, table):
+    if DATABASE_URL:
+        return {
+            row["column_name"]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=?",
+                (table,),
+            )
+        }
+    return {row["name"] for row in conn.execute("PRAGMA table_info(%s)" % table)}
 
 
 def rows(conn, sql, args=()):
@@ -396,32 +425,35 @@ def init_db():
     UPLOADS.mkdir(parents=True, exist_ok=True)
     UPLOAD_TMP.mkdir(parents=True, exist_ok=True)
     conn = db()
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.executescript(SCHEMA)
+    if DATABASE_URL:
+        conn.executescript(postgres_schema(SCHEMA))
+    else:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.executescript(SCHEMA)
     cutoff = now() - 24 * 60 * 60
     for upload in rows(conn, "SELECT token FROM benefit_uploads WHERE created_at<?", (cutoff,)):
         staged_path = UPLOAD_TMP / (upload["token"] + ".part")
         if staged_path.exists():
             staged_path.unlink()
     conn.execute("DELETE FROM benefit_uploads WHERE created_at<?", (cutoff,))
-    resource_columns = {r["name"] for r in conn.execute("PRAGMA table_info(lesson_resources)")}
+    resource_columns = table_columns(conn, "lesson_resources")
     if "audio_playlist_id" not in resource_columns:
         conn.execute("ALTER TABLE lesson_resources ADD COLUMN audio_playlist_id INTEGER REFERENCES lesson_audio_playlists(id) ON DELETE SET NULL")
-    chat_columns = {r["name"] for r in conn.execute("PRAGMA table_info(chat_messages)")}
+    chat_columns = table_columns(conn, "chat_messages")
     for column, definition in (("attachment_path", "TEXT NOT NULL DEFAULT ''"),
                                ("attachment_name", "TEXT NOT NULL DEFAULT ''"),
                                ("attachment_type", "TEXT NOT NULL DEFAULT ''"),
                                ("read_at", "INTEGER")):
         if column not in chat_columns:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN %s %s" % (column, definition))
-    message_columns = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    message_columns = table_columns(conn, "messages")
     for column, definition in (("user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL"),
                                ("reply_text", "TEXT NOT NULL DEFAULT ''"),
                                ("replied_at", "INTEGER")):
         if column not in message_columns:
             conn.execute("ALTER TABLE messages ADD COLUMN %s %s" % (column, definition))
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_inbox ON chat_messages(recipient_id,read_at,id)")
-    user_columns = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    user_columns = table_columns(conn, "users")
     if "gender" not in user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN gender TEXT NOT NULL DEFAULT ''")
     if "avatar_path" not in user_columns:
@@ -434,10 +466,10 @@ def init_db():
         conn.execute("ALTER TABLE users ADD COLUMN telegram_chat_id TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_user ON users(telegram_user_id) "
                  "WHERE telegram_user_id IS NOT NULL")
-    outbox_columns = {r["name"] for r in conn.execute("PRAGMA table_info(outbox)")}
+    outbox_columns = table_columns(conn, "outbox")
     if "gender" not in outbox_columns:
         conn.execute("ALTER TABLE outbox ADD COLUMN gender TEXT NOT NULL DEFAULT ''")
-    video_columns = {r["name"] for r in conn.execute("PRAGMA table_info(videos)")}
+    video_columns = table_columns(conn, "videos")
     if "category" not in video_columns:
         conn.execute("ALTER TABLE videos ADD COLUMN category TEXT NOT NULL DEFAULT ''")
     if "media_type" not in video_columns:
@@ -446,10 +478,10 @@ def init_db():
         conn.execute("ALTER TABLE videos ADD COLUMN media_url TEXT NOT NULL DEFAULT ''")
     if "media_path" not in video_columns:
         conn.execute("ALTER TABLE videos ADD COLUMN media_path TEXT NOT NULL DEFAULT ''")
-    benefit_columns = {r["name"] for r in conn.execute("PRAGMA table_info(benefits)")}
+    benefit_columns = table_columns(conn, "benefits")
     if "youtube_id" not in benefit_columns:
         conn.execute("ALTER TABLE benefits ADD COLUMN youtube_id TEXT NOT NULL DEFAULT ''")
-    word_columns = {r["name"] for r in conn.execute("PRAGMA table_info(words)")}
+    word_columns = table_columns(conn, "words")
     if "image_url" not in word_columns:
         conn.execute("ALTER TABLE words ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
     if "youtube_url" not in word_columns:
@@ -1202,7 +1234,7 @@ def api_signup(ctx):
     try:
         cur = c.execute("INSERT INTO users (username,name,gender,password_hash,role,created_at) VALUES (?,?,?,?,?,?)",
                         (username, name, gender, hash_pw(b["password"]), "student", now()))
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERRORS:
         raise ApiError(409, "معرّف تيليجرام هذا مسجّل من قبل")
     uid = cur.lastrowid
     rl_add("signup:" + ctx.ip)
@@ -1970,7 +2002,7 @@ def adm_benefit_upload_complete(ctx, token):
                                "VALUES (?,?,?,?,?,?,?,?)",
                                (upload["title"], upload["description"], upload["kind"], path,
                                 upload["original_name"], upload["total_size"], ctx.user["id"], now()))
-    except sqlite3.Error:
+    except DB_ERRORS:
         if final_path.exists():
             final_path.unlink()
         raise
@@ -2165,7 +2197,7 @@ def adm_sup_add(ctx):
     try:
         cur = c.execute("INSERT INTO users (username,name,gender,password_hash,role,created_at) VALUES (?,?,?,?,?,?)",
                         (username, name, gender, hash_pw(b["password"]), "supervisor", now()))
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERRORS:
         raise ApiError(409, "هذا المعرّف مستخدم من قبل")
     c.executemany("INSERT OR IGNORE INTO supervisor_programs (user_id,program_key) VALUES (?,?)",
                   [(cur.lastrowid, r["key"]) for r in rows(c, "SELECT key FROM programs")])
@@ -2570,7 +2602,7 @@ def adm_category_add(ctx):
     try:
         ctx.conn.execute("INSERT INTO categories (key,name,description,sort) VALUES (?,?,?,?)",
                          (key, name, description, integer(ctx.body, "sort")))
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERRORS:
         raise ApiError(409, "يوجد علم بهذا الاسم بالفعل")
     return {"key": key}
 
@@ -2584,7 +2616,7 @@ def adm_category_update(ctx, category_key):
     try:
         ctx.conn.execute("UPDATE categories SET name=?,description=?,sort=? WHERE key=?",
                          (name, description, integer(ctx.body, "sort"), category_key))
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERRORS:
         raise ApiError(409, "يوجد علم بهذا الاسم بالفعل")
     return {"ok": True}
 

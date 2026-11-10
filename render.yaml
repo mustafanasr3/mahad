@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: mahad
+    runtime: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.9
+      - key: DATABASE_URL
+        sync: false
+      - key: SECURE_COOKIE
+        value: "1"
